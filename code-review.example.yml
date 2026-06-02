@@ -1,0 +1,26 @@
+# Sample caller workflow.
+#
+# Copy this file into your repo as `.github/workflows/code-review.yml` and edit:
+#   1. The `provider:` and `model:` inputs for your chosen LLM provider.
+#   2. The `CODE_REVIEW_API_KEY` secret mapping to point at the secret you've
+#      stored in your repo (or org) settings.
+#
+# Optional: drop a `.code-review.yml` file at your repo root for per-repo
+# review tuning (context, accepted patterns, ignored paths, severity floor).
+# See CODE_REVIEW_DOC.md for the schema.
+
+name: Code Review
+
+on:
+    pull_request:
+        types: [opened, synchronize, reopened, ready_for_review]
+        branches: [master, main]
+
+jobs:
+    review:
+        uses: SamyakTechLabs/.github/.github/workflows/code-review.yml@main
+        with:
+            provider: openai
+            model: gpt-4o
+        secrets:
+            CODE_REVIEW_API_KEY: ${{ secrets.OPENAI_API_KEY }}

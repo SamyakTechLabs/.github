@@ -6,7 +6,22 @@ A provider-agnostic GitHub Actions workflow that runs an LLM-driven code review 
 - **Helper script:** `.github/scripts/code-review/call_api.py`
 - **Sample caller:** [`code-review.example.yml`](./code-review.example.yml)
 
-## What it does
+## Contents
+
+- [What it does](#what-it-does)
+- [Quick start](#quick-start)
+- [Provider examples](#provider-examples)
+- [Inputs reference](#inputs-reference)
+- [Secrets reference](#secrets-reference)
+- [Per-repo configuration & context (`.code-review.yml`)](#code-review-yml-reference)
+- [How comments get posted](#how-comments-get-posted)
+- [Triggers and skip conditions](#triggers-and-skip-conditions)
+- [Permissions](#permissions)
+- [Cost / latency notes](#cost-and-latency)
+- [Troubleshooting](#troubleshooting)
+
+<details id="what-it-does">
+<summary><b>What it does</b></summary>
 
 1. On every non-draft pull request: collects the diff of changed files (excluding lockfiles, images, markdown).
 2. Sends each file's diff to the chosen LLM provider with a strict reviewer system prompt — flag concrete bugs/security/data/breaking issues only; no style.
@@ -14,7 +29,10 @@ A provider-agnostic GitHub Actions workflow that runs an LLM-driven code review 
 4. Deduplicates against prior bot comments on the same PR (updates instead of re-posting).
 5. Posts a single summary comment at the end ("All good" or a one-line risk assessment).
 
-## Quick start
+</details>
+
+<details id="quick-start">
+<summary><b>Quick start</b></summary>
 
 ### 1. Add the caller workflow
 
@@ -44,9 +62,12 @@ Repo settings → Secrets and variables → Actions → New repository secret. N
 
 ### 3. (Optional) Tune per-repo behaviour
 
-Add a `.code-review.yml` file at the root of your repo — see [`.code-review.yml` reference](#code-reviewyml-reference) below.
+Add a `.code-review.yml` file at the root of your repo — see [Per-repo configuration & context (`.code-review.yml`)](#code-review-yml-reference) below.
 
-## Provider examples
+</details>
+
+<details id="provider-examples">
+<summary><b>Provider examples</b></summary>
 
 ### OpenAI
 
@@ -125,7 +146,10 @@ secrets:
     CODE_REVIEW_API_KEY: ${{ secrets.OLLAMA_BEARER_TOKEN }}
 ```
 
-## Inputs reference
+</details>
+
+<details id="inputs-reference">
+<summary><b>Inputs reference</b></summary>
 
 | Input | Required | Default | Description |
 |---|---|---|---|
@@ -137,13 +161,19 @@ secrets:
 | `timeout_minutes` | no | `10` | Job timeout. |
 | `max_diff_lines` | no | `1500` | Skip files with diffs longer than this — likely generated/vendored. |
 
-## Secrets reference
+</details>
+
+<details id="secrets-reference">
+<summary><b>Secrets reference</b></summary>
 
 | Secret | Required | Description |
 |---|---|---|
 | `CODE_REVIEW_API_KEY` | yes | The provider's API key. Map your provider-specific secret (e.g. `OPENAI_API_KEY`) to this canonical name in the caller's `secrets:` block. |
 
-## `.code-review.yml` reference
+</details>
+
+<details id="code-review-yml-reference">
+<summary><b>Per-repo configuration &amp; context (<code>.code-review.yml</code>)</b></summary>
 
 Drop this file at the **root of your repo** (not in `.github/`) to customise review behaviour for that repo. Every key is optional — omit anything you don't need.
 
@@ -224,14 +254,20 @@ Pattern translation is naive: `**/` is dropped, `.` is escaped, `*` becomes `.*`
 echo "your/changed/file.path" | grep -E '(pattern1|pattern2)'
 ```
 
-## How comments get posted
+</details>
+
+<details id="how-comments-get-posted">
+<summary><b>How comments get posted</b></summary>
 
 - **Inline comments** are posted on lines that appear as `+` in the diff (RIGHT side of the PR). The workflow validates every line number from the LLM against the actual diff and skips any that don't match — protects against the LLM hallucinating line numbers.
 - **Deduplication:** before posting, the workflow fetches every comment by `github-actions[bot]` on the PR. A new finding on the same `path`+`line` with an identical body is skipped silently; a new finding with a different body updates the existing comment. This makes repeated `synchronize` events idempotent.
 - **Summary comment:** posted once per workflow run. It is *not* deduplicated — every run appends a fresh summary, so reviewers can scan the PR timeline to see the bot's history.
 - **Severity filter:** findings below `min_severity` are stripped *before* the comment-post step, so they never appear.
 
-## Triggers and skip conditions
+</details>
+
+<details id="triggers-and-skip-conditions">
+<summary><b>Triggers and skip conditions</b></summary>
 
 The workflow only runs for **non-draft pull requests**. The job has `if: github.event.pull_request.draft == false`. Mark a PR as Draft to suppress reviews while you iterate.
 
@@ -239,7 +275,10 @@ Recommended caller-side trigger: `pull_request` on `opened, synchronize, reopene
 
 Per-PR concurrency is enforced — pushing a new commit cancels any in-flight review for the same PR.
 
-## Permissions
+</details>
+
+<details id="permissions">
+<summary><b>Permissions</b></summary>
 
 The reusable workflow declares:
 
@@ -252,14 +291,20 @@ permissions:
 
 Caller workflows inherit these — no extra `permissions:` block needed unless your repo overrides via org/repo defaults.
 
-## Cost / latency notes
+</details>
+
+<details id="cost-and-latency">
+<summary><b>Cost / latency notes</b></summary>
 
 - One LLM call per changed file. A PR touching 30 files = 30 sequential calls.
 - Diff context is bounded at 30 unified-diff lines per file (`git diff -U30`) plus the top 100 lines of the file (for imports/types/class declaration).
 - Files larger than `max_diff_lines` (default 1500 lines of diff) are skipped — protects against accidental large vendored or generated file commits.
 - No prompt caching: every call is independent. If a single PR routinely flags 10+ files, consider lowering `model` to a cheaper tier and bumping `min_severity` to `critical`.
 
-## Troubleshooting
+</details>
+
+<details id="troubleshooting">
+<summary><b>Troubleshooting</b></summary>
 
 **The workflow ran but no comments appeared.**
 Check the "Run AI Review" step logs. Common causes:
@@ -290,20 +335,4 @@ python3 .github/scripts/code-review/call_api.py \
 
 It prints the assistant text to stdout — useful for tweaking the prompt or sanity-checking a new provider config.
 
-## Migration from the Z.AI-only version
-
-The previous `code-review.yml` was Z.AI-specific and required a `PR_REVIEW_ZAI_API_KEY` secret. To migrate a caller:
-
-```diff
- jobs:
-     review:
-         uses: SamyakTechLabs/.github/.github/workflows/code-review.yml@main
--        secrets: inherit
-+        with:
-+            provider: zai
-+            model: glm-5.1
-+        secrets:
-+            CODE_REVIEW_API_KEY: ${{ secrets.PR_REVIEW_ZAI_API_KEY }}
-```
-
-That preserves the exact prior behaviour. Switching to another provider is just a matter of changing `provider`, `model`, and the secret on the right side.
+</details>

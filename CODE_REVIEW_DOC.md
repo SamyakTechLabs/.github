@@ -15,6 +15,7 @@ A provider-agnostic GitHub Actions workflow that runs an LLM-driven code review 
 - [Secrets reference](#secrets-reference)
 - [Per-repo configuration & context (`.code-review.yml`)](#code-review-yml-reference)
 - [How comments get posted](#how-comments-get-posted)
+- [Skip & error notifications](#skip-and-error-notifications)
 - [Triggers and skip conditions](#triggers-and-skip-conditions)
 - [Permissions](#permissions)
 - [Cost / latency notes](#cost-and-latency)
@@ -160,6 +161,9 @@ secrets:
 | `extra_headers` | no | `{}` | JSON object of extra request headers. Values may contain `$CODE_REVIEW_API_KEY` (interpolated from the secret). Setting a value to `""` deletes the matching default header. |
 | `timeout_minutes` | no | `10` | Job timeout. |
 | `max_diff_lines` | no | `1500` | Skip files with diffs longer than this — likely generated/vendored. |
+| `diff_context` | no | `30` | Lines of context around each diff hunk (`git diff -U`). Lower = fewer tokens per call. `10` typically works fine. |
+| `max_files` | no | `50` | Skip the entire review (with a PR comment) when the PR touches more than this many files. Guards against runaway cost on large PRs. |
+| `parallelism` | no | `4` | Number of files reviewed concurrently. Lower it if your provider rate-limits you. |
 
 </details>
 
@@ -266,6 +270,22 @@ echo "your/changed/file.path" | grep -E '(pattern1|pattern2)'
 
 </details>
 
+<details id="skip-and-error-notifications">
+<summary><b>Skip &amp; error notifications</b></summary>
+
+Whenever a review is skipped or fails, the workflow posts a PR comment so the author isn't left guessing. Four scenarios:
+
+| Scenario | Cause | Comment posted |
+|---|---|---|
+| **No reviewable files** | Every changed file matched the ignore list (lockfiles, images, docs, or your `.code-review.yml` `ignore` patterns). | ℹ️ "No reviewable files in this PR." |
+| **Over `max_files` cap** | The PR touches more files than the configured `max_files` input. | ⚠️ "PR touches N files (max_files=M). Split into smaller PRs or raise the cap." |
+| **All per-file calls failed** | Every API call errored out (provider outage, bad key, malformed `extra_headers`, model unavailable, etc.). | ❌ "Every per-file review call failed for this PR." |
+| **Workflow step errored** | Anything unexpected — exception, timeout, OOM. Catch-all `if: failure()` step. | ❌ "The workflow failed before posting a review." + link to the run log. |
+
+Draft PRs are silent (the job has `if: github.event.pull_request.draft == false`). All other no-op exits get a comment.
+
+</details>
+
 <details id="triggers-and-skip-conditions">
 <summary><b>Triggers and skip conditions</b></summary>
 
@@ -296,9 +316,10 @@ Caller workflows inherit these — no extra `permissions:` block needed unless y
 <details id="cost-and-latency">
 <summary><b>Cost / latency notes</b></summary>
 
-- One LLM call per changed file. A PR touching 30 files = 30 sequential calls.
-- Diff context is bounded at 30 unified-diff lines per file (`git diff -U30`) plus the top 100 lines of the file (for imports/types/class declaration).
+- One LLM call per changed file, run in parallel (default `parallelism: 4`). A PR touching 30 files = 30 calls in ~8 batches.
+- Diff context is `git diff -U30` by default (configurable via `diff_context`). Lowering to `10` typically cuts token cost 30–50% with no review-quality loss.
 - Files larger than `max_diff_lines` (default 1500 lines of diff) are skipped — protects against accidental large vendored or generated file commits.
+- The whole review is skipped when the PR exceeds `max_files` (default 50). The author gets a PR comment explaining why.
 - No prompt caching: every call is independent. If a single PR routinely flags 10+ files, consider lowering `model` to a cheaper tier and bumping `min_severity` to `critical`.
 
 </details>

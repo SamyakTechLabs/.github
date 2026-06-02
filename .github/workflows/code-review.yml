@@ -54,6 +54,21 @@ on:
                 required: false
                 type: number
                 default: 1500
+            diff_context:
+                description: "Lines of context around each diff hunk (git diff -U). Lower = fewer tokens, less context."
+                required: false
+                type: number
+                default: 30
+            max_files:
+                description: "Skip the entire review if the PR touches more than this many files."
+                required: false
+                type: number
+                default: 50
+            parallelism:
+                description: "Number of files reviewed concurrently. Bound by provider rate limits."
+                required: false
+                type: number
+                default: 4
         secrets:
             CODE_REVIEW_API_KEY:
                 required: true
@@ -85,114 +100,181 @@ jobs:
             API_FORMAT: ${{ inputs.api_format }}
             EXTRA_HEADERS: ${{ inputs.extra_headers }}
             MAX_DIFF_LINES: ${{ inputs.max_diff_lines }}
+            DIFF_CONTEXT: ${{ inputs.diff_context }}
+            MAX_FILES: ${{ inputs.max_files }}
+            PARALLELISM: ${{ inputs.parallelism }}
 
         steps:
-            - name: Checkout caller repo
+            - name: Checkout caller repo (shallow)
               uses: actions/checkout@v4
               with:
-                  fetch-depth: 0
+                  fetch-depth: 1
 
-            - name: Checkout reusable workflow source (SamyakTechLabs/.github)
+            - name: Fetch base ref history
+              run: |
+                  set -euo pipefail
+                  git fetch --depth=50 origin "$BASE_REF"
+                  # Deepen on demand until merge-base resolves (very rare for normal PRs).
+                  for depth in 200 500 2000; do
+                      if git merge-base "origin/$BASE_REF" HEAD > /dev/null 2>&1; then
+                          break
+                      fi
+                      echo "Deepening history to depth=$depth..."
+                      git fetch --deepen=$depth origin "$BASE_REF"
+                  done
+
+            - name: Resolve reusable workflow ref
+              id: resolve_ref
+              run: |
+                  # GITHUB_WORKFLOW_REF format: owner/repo/path/to/workflow.yml@ref
+                  # We need <ref> for the source checkout so caller-side pinning
+                  # (uses: org/.github/...@v1.2.0) is honoured here too.
+                  RAW="${GITHUB_WORKFLOW_REF##*@}"
+                  RAW=${RAW#refs/heads/}
+                  RAW=${RAW#refs/tags/}
+                  echo "ref=$RAW" >> "$GITHUB_OUTPUT"
+                  echo "Resolved workflow ref: $RAW"
+
+            - name: Checkout reusable workflow source
               uses: actions/checkout@v4
               with:
                   repository: SamyakTechLabs/.github
                   path: .code-review-source
-                  ref: main
+                  ref: ${{ steps.resolve_ref.outputs.ref }}
 
             - name: Install dependencies
+              if: hashFiles('.code-review.yml') != ''
               run: pip3 install pyyaml
 
-            - name: Get changed files
+            - name: Parse repo config and detect changed files
               id: check_files
               run: |
                   set -euo pipefail
 
-                  IGNORE_PATTERN='(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.png$|\.jpg$|\.jpeg$|\.svg$|\.gif$|\.ico$|\.md$)'
-                  if [ -f .code-review.yml ]; then
-                    EXTRA=$(python3 -c "
-                  import yaml
-                  try:
-                    cfg = yaml.safe_load(open('.code-review.yml'))
-                    patterns = cfg.get('ignore', [])
-                    frags = [p.replace('**/', '').replace('.', '\\.').replace('*', '.*') for p in patterns]
-                    print('|'.join(frags))
-                  except:
-                    pass
-                  " 2>/dev/null || true)
-                    if [ -n "$EXTRA" ]; then
-                      IGNORE_PATTERN="${IGNORE_PATTERN}|${EXTRA}"
-                    fi
-                  fi
+                  # Single Python invocation: load .code-review.yml (if any),
+                  # compile ignore patterns into one regex, and emit the full
+                  # repo config as JSON.
+                  python3 - << 'PY' > repo-config.json
+                  import json, os, sys
+                  default = {
+                      "context": "",
+                      "accepted_patterns": [],
+                      "min_severity": "warning",
+                      "ignore_regex": "(package-lock\\.json|yarn\\.lock|pnpm-lock\\.yaml|\\.png$|\\.jpg$|\\.jpeg$|\\.svg$|\\.gif$|\\.ico$|\\.md$)",
+                  }
+                  cfg = {}
+                  if os.path.exists(".code-review.yml"):
+                      try:
+                          import yaml
+                          cfg = yaml.safe_load(open(".code-review.yml")) or {}
+                      except Exception as e:
+                          print(f"WARN: failed to parse .code-review.yml: {e}", file=sys.stderr)
+                          cfg = {}
 
-                  git fetch origin "$BASE_REF"
-                  git diff --name-only "origin/$BASE_REF...HEAD" \
-                    | grep -Ev "$IGNORE_PATTERN" \
-                    > files.txt || true
+                  patterns = cfg.get("ignore", []) or []
+                  frags = [p.replace("**/", "").replace(".", "\\.").replace("*", ".*") for p in patterns]
+                  ignore_regex = default["ignore_regex"]
+                  if frags:
+                      ignore_regex = ignore_regex[:-1] + "|" + "|".join(frags) + ")"
 
-                  if [ ! -s files.txt ]; then
-                    echo "has_changes=false" >> "$GITHUB_OUTPUT"
-                    echo "No relevant changed files found, skipping review."
-                  else
-                    echo "has_changes=true" >> "$GITHUB_OUTPUT"
-                    echo "Changed files:"
-                    cat files.txt
-                  fi
-
-            - name: Read repo config
-              if: steps.check_files.outputs.has_changes == 'true'
-              run: |
-                  if [ -f .code-review.yml ]; then
-                    python3 -c "
-                  import yaml, json
-                  cfg = yaml.safe_load(open('.code-review.yml'))
-                  print(json.dumps({
-                    'context': cfg.get('context', ''),
-                    'accepted_patterns': cfg.get('accepted_patterns', []),
-                    'min_severity': cfg.get('min_severity', 'warning')
-                  }))
-                  " 2>/dev/null > repo-config.json || echo '{"context":"","accepted_patterns":[],"min_severity":"warning"}' > repo-config.json
-                  else
-                    echo '{"context":"","accepted_patterns":[],"min_severity":"warning"}' > repo-config.json
-                  fi
+                  out = {
+                      "context": cfg.get("context", "") or "",
+                      "accepted_patterns": cfg.get("accepted_patterns", []) or [],
+                      "min_severity": cfg.get("min_severity", "warning") or "warning",
+                      "ignore_regex": ignore_regex,
+                  }
+                  print(json.dumps(out))
+                  PY
                   cat repo-config.json
 
+                  IGNORE_REGEX=$(jq -r .ignore_regex repo-config.json)
+
+                  git diff --name-only "origin/$BASE_REF...HEAD" \
+                      | grep -Ev "$IGNORE_REGEX" \
+                      > files.txt || true
+
+                  if [ ! -s files.txt ]; then
+                      echo "skip_reason=no_files" >> "$GITHUB_OUTPUT"
+                      echo "file_count=0" >> "$GITHUB_OUTPUT"
+                      echo "No relevant changed files found."
+                      exit 0
+                  fi
+
+                  FILE_COUNT=$(wc -l < files.txt | tr -d ' ')
+                  echo "file_count=$FILE_COUNT" >> "$GITHUB_OUTPUT"
+
+                  if [ "$FILE_COUNT" -gt "$MAX_FILES" ]; then
+                      echo "skip_reason=too_many_files" >> "$GITHUB_OUTPUT"
+                      echo "PR touches $FILE_COUNT files (max_files=$MAX_FILES). Will skip review."
+                      exit 0
+                  fi
+
+                  echo "skip_reason=" >> "$GITHUB_OUTPUT"
+                  echo "Changed files ($FILE_COUNT):"
+                  cat files.txt
+
+            - name: Post skip notice on PR
+              if: steps.check_files.outputs.skip_reason != ''
+              run: |
+                  set -euo pipefail
+                  REASON="${{ steps.check_files.outputs.skip_reason }}"
+                  COUNT="${{ steps.check_files.outputs.file_count }}"
+                  case "$REASON" in
+                      no_files)
+                          BODY="### 🤖 AI Code Review — skipped
+
+                  ℹ️ No reviewable files in this PR (everything was ignored, lockfiles, images, or docs).";;
+                      too_many_files)
+                          BODY="### 🤖 AI Code Review — skipped
+
+                  ⚠️ This PR touches **$COUNT files**, which exceeds the configured \`max_files=$MAX_FILES\` cap. Split into smaller PRs or raise the cap on the caller workflow.";;
+                      *)
+                          BODY="### 🤖 AI Code Review — skipped
+
+                  ℹ️ Review skipped. Reason: \`$REASON\`.";;
+                  esac
+                  curl -s -o /dev/null -X POST \
+                      -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                      -H "Content-Type: application/json" \
+                      -H "X-GitHub-Api-Version: 2022-11-28" \
+                      -d "$(jq -n --arg body "$BODY" '{body: $body}')" \
+                      "https://api.github.com/repos/$GH_REPO/issues/$PR_NUMBER/comments"
+
             - name: Fetch existing bot comments
-              if: steps.check_files.outputs.has_changes == 'true'
+              if: steps.check_files.outputs.skip_reason == ''
               run: |
                   curl -s \
-                    -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                    -H "X-GitHub-Api-Version: 2022-11-28" \
-                    "https://api.github.com/repos/$GH_REPO/pulls/$PR_NUMBER/comments?per_page=100" \
-                    | jq '[.[] | select(.user.login == "github-actions[bot]") | {id: .id, path: .path, line: .line, original_line: .original_line, body: .body}]' \
-                    > existing-inline-comments.json
+                      -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                      -H "X-GitHub-Api-Version: 2022-11-28" \
+                      "https://api.github.com/repos/$GH_REPO/pulls/$PR_NUMBER/comments?per_page=100" \
+                      | jq '[.[] | select(.user.login == "github-actions[bot]") | {id: .id, path: .path, line: .line, original_line: .original_line, body: .body}]' \
+                      > existing-inline-comments.json
 
                   curl -s \
-                    -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                    -H "X-GitHub-Api-Version: 2022-11-28" \
-                    "https://api.github.com/repos/$GH_REPO/issues/$PR_NUMBER/comments?per_page=100" \
-                    | jq '[.[] | select(.user.login == "github-actions[bot]") | .body]' \
-                    > existing-summary-comments.json
+                      -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                      -H "X-GitHub-Api-Version: 2022-11-28" \
+                      "https://api.github.com/repos/$GH_REPO/issues/$PR_NUMBER/comments?per_page=100" \
+                      | jq '[.[] | select(.user.login == "github-actions[bot]") | .body]' \
+                      > existing-summary-comments.json
 
             - name: Generate PR diff chunks
-              if: steps.check_files.outputs.has_changes == 'true'
+              if: steps.check_files.outputs.skip_reason == ''
               run: |
+                  set -euo pipefail
                   mkdir -p diffs
                   while IFS= read -r file; do
-                    mkdir -p "diffs/$(dirname "$file")"
-                    git diff -U30 "origin/$BASE_REF...HEAD" -- "$file" > "diffs/$file.diff" || true
+                      mkdir -p "diffs/$(dirname "$file")"
+                      git diff -U"$DIFF_CONTEXT" "origin/$BASE_REF...HEAD" -- "$file" > "diffs/$file.diff" || true
                   done < files.txt
 
-            - name: Run AI Review
-              if: steps.check_files.outputs.has_changes == 'true'
+            - name: Run AI Review (parallel)
+              id: ai_review
+              if: steps.check_files.outputs.skip_reason == ''
               env:
                   CODE_REVIEW_API_KEY: ${{ secrets.CODE_REVIEW_API_KEY }}
               run: |
-                  set -euo pipefail
-                  mkdir -p review
-
-                  EXISTING_INLINE=$(cat existing-inline-comments.json)
-                  REPO_CONFIG=$(cat repo-config.json)
-                  MIN_SEVERITY=$(echo "$REPO_CONFIG" | jq -r '.min_severity // "warning"')
+                  set -uo pipefail
+                  mkdir -p review review-logs
 
                   SYSTEM_PROMPT_FILE=/tmp/system.txt
                   cat > "$SYSTEM_PROMPT_FILE" << 'SYSTEM'
@@ -205,256 +287,214 @@ jobs:
                   - An empty review is the correct output for a correct diff.
                   SYSTEM
 
-                  find diffs -name "*.diff" | while IFS= read -r f; do
-                    [ -s "$f" ] || continue
+                  # Hoist shared per-file state out of the loop. These are exported
+                  # so review_one.sh sees them across parallel invocations.
+                  export PR_TITLE
+                  export MIN_SEVERITY=$(jq -r .min_severity repo-config.json)
+                  export REPO_CONTEXT=$(jq -r '.context // ""' repo-config.json)
+                  export ACCEPTED_PATTERNS=$(jq -r '(.accepted_patterns // []) | join("\n")' repo-config.json)
+                  export EXISTING_INLINE=$(cat existing-inline-comments.json)
+                  export EXISTING_SUMMARY=$(cat existing-summary-comments.json)
+                  export SYSTEM_PROMPT_FILE
+                  export PROVIDER MODEL API_URL API_FORMAT EXTRA_HEADERS MAX_DIFF_LINES CODE_REVIEW_API_KEY
+                  export CALL_API_SCRIPT="$GITHUB_WORKSPACE/.code-review-source/.github/scripts/code-review/call_api.py"
+                  export REVIEW_OUTPUT_DIR="$GITHUB_WORKSPACE/review"
+                  export REVIEW_LOG_DIR="$GITHUB_WORKSPACE/review-logs"
 
-                    FILE=$(echo "$f" | sed 's|diffs/||' | sed 's|\.diff$||')
+                  REVIEW_SCRIPT="$GITHUB_WORKSPACE/.code-review-source/.github/scripts/code-review/review_one.sh"
 
-                    LINES=$(wc -l < "$f")
-                    if [ "$LINES" -gt "$MAX_DIFF_LINES" ]; then
-                      echo "Skipping $FILE — too many lines ($LINES), likely generated"
-                      continue
-                    fi
+                  # Run reviews in parallel; xargs -P doesn't propagate child exit
+                  # codes, which is what we want — one file's failure shouldn't
+                  # kill the rest. We assess success after the fact by counting
+                  # review/*.json files.
+                  find diffs -name "*.diff" -print0 \
+                      | xargs -0 -P "$PARALLELISM" -n 1 bash "$REVIEW_SCRIPT"
 
-                    DIFF_CONTENT=$(cat "$f")
-                    FILE_HEADER=$(git show HEAD:"$FILE" 2>/dev/null | head -100 || echo "")
-                    FILE_EXISTING=$(echo "$EXISTING_INLINE" | jq --arg file "$FILE" '[.[] | select(.path == $file)]')
-                    REPO_CONTEXT=$(echo "$REPO_CONFIG" | jq -r '.context // ""')
-                    ACCEPTED_PATTERNS=$(echo "$REPO_CONFIG" | jq -r '(.accepted_patterns // []) | join("\n")')
-
-                    USER_PROMPT_FILE=/tmp/prompt.txt
-                    cat > "$USER_PROMPT_FILE" << PROMPT
-                  ## Pull Request
-                  Title: ${PR_TITLE}
-
-                  ## Repository Context
-                  ${REPO_CONTEXT}
-
-                  Accepted patterns (do not flag these):
-                  ${ACCEPTED_PATTERNS}
-
-                  ## File: ${FILE}
-
-                  ### File header (imports, types, class declaration):
-                  ${FILE_HEADER}
-
-                  ### Diff (30 lines context):
-                  ${DIFF_CONTENT}
-
-                  ## Prior review comments on this file (do not repeat or contradict these):
-                  ${FILE_EXISTING}
-
-                  ## Prior summary comments (do not repeat or contradict these):
-                  $(cat existing-summary-comments.json)
-
-                  ---
-
-                  Review ONLY the changed lines (+ lines in the diff).
-
-                  For each issue you flag, you MUST provide:
-                  1. The exact new file line number
-                  2. A concrete failure scenario: what input, state, or sequence causes this to break
-                  3. A concrete fix
-
-                  If you cannot describe a specific way the code breaks, do NOT flag it.
-
-                  ### What to flag:
-                  - Bug: reachable condition where code produces wrong result, crashes, or hangs
-                  - Security: concrete exploit path (injection, auth bypass, SSRF, secret leak)
-                  - Data integrity: silent data loss, missing rollback, race condition with real trigger
-                  - Breaking contract: return type change, removed required field, changed API behavior
-
-                  ### What to NEVER flag:
-                  - Style, formatting, naming, comments, documentation
-                  - Patterns already established in the file
-                  - Missing error handling for conditions the surrounding code already guards against
-                  - Hypothetical issues requiring unreachable conditions
-                  - Anything on lines NOT changed in this diff
-                  - Issues already raised in prior review comments above
-
-                  Return ONLY valid JSON. No markdown. No preamble.
-
-                  {
-                    "summary": "One sentence: what this change does. Risk: low|medium|high.",
-                    "comments": [
-                      {
-                        "line": <new_file_line_number>,
-                        "severity": "critical|warning",
-                        "comment": "**Bug/Security/Data/Breaking**: what breaks and when. Fix: specific fix."
-                      }
-                    ]
-                  }
-                  PROMPT
-
-                    if ! TEXT=$(python3 .code-review-source/.github/scripts/code-review/call_api.py \
-                          --provider "$PROVIDER" \
-                          --model "$MODEL" \
-                          --system-prompt-file "$SYSTEM_PROMPT_FILE" \
-                          --user-prompt-file "$USER_PROMPT_FILE" \
-                          --api-url "$API_URL" \
-                          --api-format "$API_FORMAT" \
-                          --extra-headers "$EXTRA_HEADERS"); then
-                      echo "API call failed for $FILE — skipping"
-                      continue
-                    fi
-
-                    # Strip optional ```json fences the model may emit.
-                    TEXT=$(printf '%s' "$TEXT" | sed '1{/^```/d}' | sed '${/^```/d}')
-
-                    if ! echo "$TEXT" | jq empty 2>/dev/null; then
-                      echo "Skipping invalid JSON response for $FILE"
-                      continue
-                    fi
-
-                    TEXT=$(echo "$TEXT" | jq \
-                      --arg min "$MIN_SEVERITY" '
-                      def sev_rank: if . == "critical" then 2 elif . == "warning" then 1 else 0 end;
-                      def min_rank: $min | sev_rank;
-                      .comments = [.comments[] | select((.severity | sev_rank) >= min_rank)]
-                      | .
-                    ')
-
-                    SAFE_NAME=$(echo "$FILE" | tr '/' '_')
-                    echo "$TEXT" | jq --arg file "$FILE" '. + {file: $file}' > "review/${SAFE_NAME}.json"
+                  # Dump per-file logs sequentially so the run log is readable.
+                  for log in review-logs/*.log; do
+                      [ -e "$log" ] || continue
+                      cat "$log"
                   done
 
+                  DIFFS_COUNT=$(find diffs -name "*.diff" -type f -not -empty | wc -l | tr -d ' ')
+                  REVIEWS_COUNT=$(find review -name "*.json" | wc -l | tr -d ' ')
+                  echo "diffs_count=$DIFFS_COUNT" >> "$GITHUB_OUTPUT"
+                  echo "reviews_count=$REVIEWS_COUNT" >> "$GITHUB_OUTPUT"
+                  echo "Reviewed $REVIEWS_COUNT/$DIFFS_COUNT files successfully."
+
+                  if [ "$DIFFS_COUNT" -gt 0 ] && [ "$REVIEWS_COUNT" -eq 0 ]; then
+                      echo "review_status=all_failed" >> "$GITHUB_OUTPUT"
+                  else
+                      echo "review_status=ok" >> "$GITHUB_OUTPUT"
+                  fi
+
+            - name: Post all-failed notice on PR
+              if: steps.check_files.outputs.skip_reason == '' && steps.ai_review.outputs.review_status == 'all_failed'
+              run: |
+                  set -euo pipefail
+                  BODY="### 🤖 AI Code Review — failed
+
+                  ❌ Every per-file review call failed for this PR (${{ steps.ai_review.outputs.diffs_count }} files attempted, 0 succeeded).
+
+                  Common causes: provider API outage, invalid \`CODE_REVIEW_API_KEY\`, model not available for your account, malformed \`extra_headers\`. Check the workflow logs for details."
+                  curl -s -o /dev/null -X POST \
+                      -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                      -H "Content-Type: application/json" \
+                      -H "X-GitHub-Api-Version: 2022-11-28" \
+                      -d "$(jq -n --arg body "$BODY" '{body: $body}')" \
+                      "https://api.github.com/repos/$GH_REPO/issues/$PR_NUMBER/comments"
+
             - name: Aggregate review
-              if: steps.check_files.outputs.has_changes == 'true'
+              if: steps.check_files.outputs.skip_reason == '' && steps.ai_review.outputs.review_status == 'ok'
               run: |
                   if compgen -G "review/*.json" > /dev/null; then
-                    find review -name "*.json" -print0 | xargs -0 jq -s '.' > full-review.json
+                      find review -name "*.json" -print0 | xargs -0 jq -s '.' > full-review.json
                   else
-                    echo "[]" > full-review.json
+                      echo "[]" > full-review.json
                   fi
                   cat full-review.json
 
             - name: Post inline comments (create or update)
-              if: steps.check_files.outputs.has_changes == 'true'
+              if: steps.check_files.outputs.skip_reason == '' && steps.ai_review.outputs.review_status == 'ok'
               run: |
                   set -euo pipefail
                   EXISTING=$(cat existing-inline-comments.json)
 
                   LATEST_SHA=$(curl -s \
-                    -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                    -H "X-GitHub-Api-Version: 2022-11-28" \
-                    "https://api.github.com/repos/$GH_REPO/pulls/$PR_NUMBER" \
-                    | jq -r '.head.sha')
+                      -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                      -H "X-GitHub-Api-Version: 2022-11-28" \
+                      "https://api.github.com/repos/$GH_REPO/pulls/$PR_NUMBER" \
+                      | jq -r '.head.sha')
 
                   jq -c '.[]' full-review.json | while IFS= read -r item; do
-                    FILE=$(echo "$item" | jq -r '.file')
-                    DIFF_FILE="diffs/$FILE.diff"
+                      FILE=$(echo "$item" | jq -r '.file')
+                      DIFF_FILE="diffs/$FILE.diff"
 
-                    VALID_LINES=$(awk '
-                      /^@@/ {
-                        split($3, arr, ",");
-                        line = substr(arr[1], 2) + 0;
-                        next;
-                      }
-                      /^\+/ && !/^\+\+\+/ {
-                        print line;
-                        line++;
-                        next;
-                      }
-                      /^-/ && !/^---/ {
-                        next;
-                      }
-                      {
-                        line++;
-                      }
-                    ' "$DIFF_FILE")
+                      VALID_LINES=$(awk '
+                          /^@@/ {
+                              split($3, arr, ",");
+                              line = substr(arr[1], 2) + 0;
+                              next;
+                          }
+                          /^\+/ && !/^\+\+\+/ {
+                              print line;
+                              line++;
+                              next;
+                          }
+                          /^-/ && !/^---/ {
+                              next;
+                          }
+                          {
+                              line++;
+                          }
+                      ' "$DIFF_FILE")
 
-                    echo "$item" | jq -c '.comments[]?' | while IFS= read -r c; do
-                      LINE=$(echo "$c" | jq -r '.line')
-                      BODY=$(echo "$c" | jq -r '.comment')
+                      echo "$item" | jq -c '.comments[]?' | while IFS= read -r c; do
+                          LINE=$(echo "$c" | jq -r '.line')
+                          BODY=$(echo "$c" | jq -r '.comment')
 
-                      if ! echo "$VALID_LINES" | grep -qx "$LINE"; then
-                        echo "Skipping $FILE:$LINE — not in diff"
-                        continue
-                      fi
+                          if ! echo "$VALID_LINES" | grep -qx "$LINE"; then
+                              echo "Skipping $FILE:$LINE — not in diff"
+                              continue
+                          fi
 
-                      MATCH=$(echo "$EXISTING" | jq \
-                        --arg path "$FILE" \
-                        --argjson line "$LINE" \
-                        --arg body "$BODY" '
-                        [
-                          .[] |
-                          select(
-                            .path == $path and
-                            (
-                              .line == $line or
-                              .original_line == $line or
-                              (.body | contains($body[0:50]))
-                            )
-                          )
-                        ][0]')
-                      COMMENT_ID=$(echo "$MATCH" | jq -r '.id // empty')
-                      EXISTING_BODY=$(echo "$MATCH" | jq -r '.body // empty')
+                          MATCH=$(echo "$EXISTING" | jq \
+                              --arg path "$FILE" \
+                              --argjson line "$LINE" \
+                              --arg body "$BODY" '
+                              [
+                                  .[] |
+                                  select(
+                                      .path == $path and
+                                      (
+                                          .line == $line or
+                                          .original_line == $line or
+                                          (.body | contains($body[0:50]))
+                                      )
+                                  )
+                              ][0]')
+                          COMMENT_ID=$(echo "$MATCH" | jq -r '.id // empty')
+                          EXISTING_BODY=$(echo "$MATCH" | jq -r '.body // empty')
 
-                      if [ -n "$COMMENT_ID" ]; then
-                        if [ "$BODY" = "$EXISTING_BODY" ]; then
-                          echo "No change for $FILE:$LINE"
-                          continue
-                        fi
-                        echo "Updating comment on $FILE:$LINE"
-                        for i in {1..3}; do
-                          RESP=$(curl -s -o /tmp/update.json -w "%{http_code}" \
-                            -X PATCH \
-                            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                            -H "Content-Type: application/json" \
-                            -H "X-GitHub-Api-Version: 2022-11-28" \
-                            -d "$(jq -n --arg body "$BODY" '{body: $body}')" \
-                            "https://api.github.com/repos/$GH_REPO/pulls/comments/$COMMENT_ID")
-                          [ "$RESP" = "200" ] && break
-                          echo "Retry update ($i)..."
-                          sleep 2
-                        done
-                        if [ "$RESP" != "200" ]; then echo "Failed to update comment"; cat /tmp/update.json || true; fi
-                      else
-                        echo "Creating comment on $FILE:$LINE"
-                        PAYLOAD=$(jq -n \
-                          --arg path "$FILE" \
-                          --arg body "$BODY" \
-                          --arg commit "$LATEST_SHA" \
-                          --argjson line "$LINE" \
-                          '{body: $body, commit_id: $commit, path: $path, line: $line, side: "RIGHT"}')
-                        for i in {1..3}; do
-                          RESP=$(curl -s -o /tmp/create.json -w "%{http_code}" \
-                            -X POST \
-                            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                            -H "Content-Type: application/json" \
-                            -H "X-GitHub-Api-Version: 2022-11-28" \
-                            -d "$PAYLOAD" \
-                            "https://api.github.com/repos/$GH_REPO/pulls/$PR_NUMBER/comments")
-                          [ "$RESP" = "201" ] && break
-                          echo "Retry create ($i)..."
-                          sleep 2
-                        done
-                        if [ "$RESP" != "201" ]; then echo "Failed to create comment"; cat /tmp/create.json || true; fi
-                      fi
-                    done
+                          if [ -n "$COMMENT_ID" ]; then
+                              if [ "$BODY" = "$EXISTING_BODY" ]; then
+                                  echo "No change for $FILE:$LINE"
+                                  continue
+                              fi
+                              echo "Updating comment on $FILE:$LINE"
+                              for i in {1..3}; do
+                                  RESP=$(curl -s -o /tmp/update.json -w "%{http_code}" \
+                                      -X PATCH \
+                                      -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                                      -H "Content-Type: application/json" \
+                                      -H "X-GitHub-Api-Version: 2022-11-28" \
+                                      -d "$(jq -n --arg body "$BODY" '{body: $body}')" \
+                                      "https://api.github.com/repos/$GH_REPO/pulls/comments/$COMMENT_ID")
+                                  [ "$RESP" = "200" ] && break
+                                  echo "Retry update ($i)..."
+                                  sleep 2
+                              done
+                              if [ "$RESP" != "200" ]; then echo "Failed to update comment"; cat /tmp/update.json || true; fi
+                          else
+                              echo "Creating comment on $FILE:$LINE"
+                              PAYLOAD=$(jq -n \
+                                  --arg path "$FILE" \
+                                  --arg body "$BODY" \
+                                  --arg commit "$LATEST_SHA" \
+                                  --argjson line "$LINE" \
+                                  '{body: $body, commit_id: $commit, path: $path, line: $line, side: "RIGHT"}')
+                              for i in {1..3}; do
+                                  RESP=$(curl -s -o /tmp/create.json -w "%{http_code}" \
+                                      -X POST \
+                                      -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                                      -H "Content-Type: application/json" \
+                                      -H "X-GitHub-Api-Version: 2022-11-28" \
+                                      -d "$PAYLOAD" \
+                                      "https://api.github.com/repos/$GH_REPO/pulls/$PR_NUMBER/comments")
+                                  [ "$RESP" = "201" ] && break
+                                  echo "Retry create ($i)..."
+                                  sleep 2
+                              done
+                              if [ "$RESP" != "201" ]; then echo "Failed to create comment"; cat /tmp/create.json || true; fi
+                          fi
+                      done
                   done
 
             - name: Post summary comment
-              if: steps.check_files.outputs.has_changes == 'true'
+              if: steps.check_files.outputs.skip_reason == '' && steps.ai_review.outputs.review_status == 'ok'
               run: |
                   TOTAL_COMMENTS=$(jq '[.[].comments // [] | length] | add // 0' full-review.json)
                   SUMMARY=$(jq -r '.[].summary // empty' full-review.json | awk 'NR>1{print "\n"} {print}')
 
                   if [ "$TOTAL_COMMENTS" -eq 0 ]; then
-                    BODY="### 🤖 AI Code Review Summary
+                      BODY="### 🤖 AI Code Review Summary
 
                   ✅ **All good** — no issues found.
 
                   ${SUMMARY}"
                   else
-                    BODY="### 🤖 AI Code Review Summary
+                      BODY="### 🤖 AI Code Review Summary
 
                   ${SUMMARY}"
                   fi
 
                   curl -s -o /dev/null -X POST \
-                    -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                    -H "Content-Type: application/json" \
-                    -H "X-GitHub-Api-Version: 2022-11-28" \
-                    -d "$(jq -n --arg body "$BODY" '{body: $body}')" \
-                    "https://api.github.com/repos/$GH_REPO/issues/$PR_NUMBER/comments"
+                      -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                      -H "Content-Type: application/json" \
+                      -H "X-GitHub-Api-Version: 2022-11-28" \
+                      -d "$(jq -n --arg body "$BODY" '{body: $body}')" \
+                      "https://api.github.com/repos/$GH_REPO/issues/$PR_NUMBER/comments"
+
+            - name: Post failure notice on PR (catch-all)
+              if: failure() && github.event.pull_request.draft == false
+              run: |
+                  set -euo pipefail
+                  BODY="### 🤖 AI Code Review — errored
+
+                  ❌ The workflow failed before posting a review. See [the run logs](https://github.com/$GH_REPO/actions/runs/${{ github.run_id }}) for details."
+                  curl -s -o /dev/null -X POST \
+                      -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                      -H "Content-Type: application/json" \
+                      -H "X-GitHub-Api-Version: 2022-11-28" \
+                      -d "$(jq -n --arg body "$BODY" '{body: $body}')" \
+                      "https://api.github.com/repos/$GH_REPO/issues/$PR_NUMBER/comments" || true

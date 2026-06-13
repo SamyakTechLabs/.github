@@ -1,0 +1,38 @@
+# sanitizer.config — configuration for the S3 file sanitizer Lambda.
+#
+# This file is sourced by deploy.sh. Generate it interactively with
+# ./configure.sh, or copy this example to `sanitizer.config` and edit by hand.
+#
+# Every value can also be overridden on the deploy.sh command line, e.g.
+#   ./deploy.sh --region us-east-1 --bucket my-bucket
+
+# ── AWS region ────────────────────────────────────────────────────────────────
+# The region the Lambda and ALL target buckets live in.
+# S3 → Lambda event notifications are same-region only, so every bucket listed
+# in BUCKETS must be in this region.
+REGION="ap-south-1"
+
+# ── Target buckets ────────────────────────────────────────────────────────────
+# Space-separated list of S3 bucket names to attach the sanitizer to.
+# Example: BUCKETS="uploads-prod uploads-staging avatars-prod"
+BUCKETS="my-uploads-bucket"
+
+# ── Naming ────────────────────────────────────────────────────────────────────
+# Lambda function name and dependency-layer name. Change these if you run
+# multiple independent sanitizers in one account/region.
+FUNCTION_NAME="s3-file-sanitizer"
+LAYER_NAME="s3-file-sanitizer-deps"
+
+# ── Trigger scope ─────────────────────────────────────────────────────────────
+# Restrict the trigger to keys under this prefix (e.g. "uploads/").
+# Leave empty to sanitize every object created in the bucket.
+PREFIX=""
+
+# ── Lambda runtime tuning ─────────────────────────────────────────────────────
+MEMORY=512          # MB
+TIMEOUT=60          # seconds
+RUNTIME="python3.11"
+
+# ── Sanitizer limits (passed to the function as environment variables) ─────────
+MAX_FILE_SIZE_MB=50         # Largest object processed, in MB
+MAX_IMAGE_DIMENSION=4096    # Max image width/height in px; larger images are downscaled

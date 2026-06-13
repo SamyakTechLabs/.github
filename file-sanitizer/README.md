@@ -209,6 +209,21 @@ For each bucket, `deploy.sh` adds a Lambda resource policy statement allowing
 `--source-account` (your account). This is what lets the bucket's event
 notification actually fire the function.
 
+### No application secrets
+
+There are **no API keys, tokens, or passwords** to manage anywhere — not in this
+repo, not in the function's environment, not in the config file. The sanitizer
+only talks to S3 within your own AWS account, and all authorization is via IAM:
+
+- **At runtime** the function uses `boto3.client('s3')` with no credentials —
+  AWS injects temporary credentials from the execution role automatically.
+- **At deploy time** `deploy.sh` uses your AWS CLI credentials (the deploying
+  identity), which live in your environment or CI secret store via
+  `aws configure` / `aws sso login` / CI OIDC — never committed here.
+
+The only env vars the function carries are the non-sensitive tuning values
+`MAX_FILE_SIZE_MB` and `MAX_IMAGE_DIMENSION`.
+
 ---
 
 <a id="deployment"></a>

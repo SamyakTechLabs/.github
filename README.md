@@ -30,6 +30,13 @@ jobs:
             CODE_REVIEW_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 ```
 
+### Lambda thumbnail generator
+
+Container-based AWS Lambda for generating S3 image thumbnails in multiple sizes
+when new objects are uploaded.
+
+-> **[thumbnail-generator-lambda/README.md](./thumbnail-generator-lambda/README.md)** - setup, deployment, and testing notes.
+
 ## Repo layout
 
 ```
@@ -41,6 +48,11 @@ jobs:
 code-review/
     README.md                          # full code-review docs
     code-review.example.yml            # sample caller workflow
+thumbnail-generator-lambda/
+    README.md                          # Lambda thumbnail generator docs
+    app.py                             # S3-event Lambda handler
+    Dockerfile                         # container image definition
+    requirements.txt                   # Pillow, boto3
 profile/
     README.md                          # rendered on the org's GitHub page
 ```

@@ -1,0 +1,26 @@
+.worktrees/
+.docker-temp/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Terraform runtime state and plans
+**/.terraform/
+**/terraform.tfstate
+**/terraform.tfstate.*
+**/*.tfplan
+**/*.auto.tfvars
+**/*.auto.tfvars.json
+infra/terraform/generated/
+
+# Deployment reports are generated per run
+reports/*
+!reports/.gitkeep
+
+# Logs and local tooling output
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
